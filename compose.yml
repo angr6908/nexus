@@ -1,0 +1,20 @@
+services:
+  nexus:
+    image: docker.io/unmol637/nexus:latest
+    container_name: nexus
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=0
+    environment:
+      - WARP=true
+      - PASSWORD=123456
+    ports:
+      - "55555:55555/udp"
+      - "55556:55556/tcp"
+      - "55557:55557/tcp"
+      - "55558:55558/tcp"
+    volumes:
+      - ./data:/data

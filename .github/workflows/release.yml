@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: unmol637/nexus
+      SNELL_VERSION: "5.0.1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Resolve upstream versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          singbox_tag="$(gh release view --repo SagerNet/sing-box --json tagName --jq .tagName)"
+          wgcf_tag="$(gh release view --repo ViRb3/wgcf --json tagName --jq .tagName)"
+
+          {
+            echo "singbox=${singbox_tag#v}"
+            echo "wgcf=${wgcf_tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch snell-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-amd64.zip"
+          echo "Downloading $url"
+          curl -fsSL "$url" -o /tmp/snell.zip
+          unzip -o /tmp/snell.zip -d /tmp/snell
+          install -m 0755 /tmp/snell/snell-server "${{ github.workspace }}/snell-server"
+          echo "::group::snell-server info"
+          file "${{ github.workspace }}/snell-server"
+          echo "::endgroup::"
+          ls -l "${{ github.workspace }}/snell-server"
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            SINGBOX_VERSION=${{ steps.versions.outputs.singbox }}
+            WGCF_VERSION=${{ steps.versions.outputs.wgcf }}

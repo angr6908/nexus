@@ -1,0 +1,228 @@
+#!/bin/sh
+set -e
+
+rand_secret() {
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
+}
+
+DATA_DIR=/data
+# Fixed internal listen ports — remap on the host via Docker's `ports:` if needed.
+PORT=55555
+VLESS_PORT=55556
+TROJAN_PORT=55557
+SNELL_PORT=55558
+PASSWORD="${PASSWORD:-$(rand_secret)}"
+WARP="${WARP:-false}"
+# Public IP for the share links. Detected here, before WARP comes up, so it's
+# the server's real inbound address and not the WARP exit IP.
+SERVER="$(wget -qO- -T 5 http://api.ipify.org 2>/dev/null || true)"
+
+json_escape() {
+  awk 'BEGIN {
+    value = ARGV[1]
+    ARGV[1] = ""
+    gsub(/\\/, "\\\\", value)
+    gsub(/"/, "\\\"", value)
+    gsub(/\r/, "\\r", value)
+    gsub(/\t/, "\\t", value)
+    gsub(/\n/, "\\n", value)
+    printf "%s", value
+  }' "$1"
+}
+
+warp_enabled() {
+  case "$WARP" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+setup_warp() {
+  if [ ! -f "$DATA_DIR/warp.conf" ]; then
+    echo "Registering WARP account..."
+    (
+      cd /tmp
+      wgcf register --accept-tos
+      wgcf generate
+      # Force IPv4 endpoint and set MTU
+      sed -i 's|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = 162.159.192.1:2408|' /tmp/wgcf-profile.conf
+      sed -i 's|^[[:space:]]*MTU[[:space:]]*=.*|MTU = 1280|' /tmp/wgcf-profile.conf
+      cp /tmp/wgcf-profile.conf "$DATA_DIR/warp.conf"
+    )
+    chmod 600 "$DATA_DIR/warp.conf"
+  fi
+  # wg-quick would rewrite resolv.conf via the DNS line; sing-box handles
+  # its own DNS, so drop it and let the container resolver work normally.
+  # Also sanitize any existing persisted config.
+  sed -i '/^[[:space:]]*DNS[[:space:]]*=/d' "$DATA_DIR/warp.conf"
+}
+
+mkdir -p "$DATA_DIR"
+
+if [ ! -f "$DATA_DIR/cert.pem" ]; then
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+    -keyout "$DATA_DIR/key.pem" -out "$DATA_DIR/cert.pem" \
+    -days 3650 -nodes -subj "/CN=www.alibaba.com"
+fi
+
+if [ ! -f "$DATA_DIR/reality.env" ]; then
+  VLESS_UUID=$(cat /proc/sys/kernel/random/uuid)
+  REALITY_KEYS=$(sing-box generate reality-keypair)
+  REALITY_PRIVATE=$(echo "$REALITY_KEYS" | awk '/PrivateKey/{print $2}')
+  REALITY_PUBLIC=$(echo "$REALITY_KEYS" | awk '/PublicKey/{print $2}')
+  REALITY_SHORT_ID=$(openssl rand -hex 8)
+  cat > "$DATA_DIR/reality.env" << ENV
+VLESS_UUID=${VLESS_UUID}
+REALITY_PRIVATE=${REALITY_PRIVATE}
+REALITY_PUBLIC=${REALITY_PUBLIC}
+REALITY_SHORT_ID=${REALITY_SHORT_ID}
+ENV
+fi
+. "$DATA_DIR/reality.env"
+
+if warp_enabled; then
+  if ! command -v wg-quick >/dev/null 2>&1; then
+    echo "[warp] wg-quick not found — install wireguard-tools in the image" >&2
+    exit 1
+  fi
+  setup_warp
+  if [ -f "$DATA_DIR/warp.conf" ]; then
+    # Alpine disables IPv6 by default; wg-quick needs it for ::/0 AllowedIPs.
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+    wg-quick up "$DATA_DIR/warp.conf"
+    # wg-quick routes public-IP destinations through WARP by default, which
+    # breaks return traffic for inbound Docker-published connections. Ensure
+    # packets originating from the container's eth0 address still use the
+    # main routing table so responses to clients go back through Docker's bridge.
+    if command -v ip >/dev/null 2>&1; then
+      ETH0_IP=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+      if [ -n "$ETH0_IP" ]; then
+        ip rule add from "$ETH0_IP" lookup main pref 100 2>/dev/null || true
+      fi
+      ETH0_IP6=$(ip -6 -o addr show eth0 scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+      if [ -n "$ETH0_IP6" ]; then
+        ip -6 rule add from "$ETH0_IP6" lookup main pref 100 2>/dev/null || true
+      fi
+    fi
+    echo "[warp] enabled (system wg interface: warp)"
+  fi
+else
+  echo "[warp] off"
+fi
+
+cat > "$DATA_DIR/config.json" << CONFIG
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-upstream"
+      }
+    ],
+    "rules": [
+      {
+        "server": "dns-upstream",
+        "strategy": "prefer_ipv6"
+      }
+    ],
+    "strategy": "prefer_ipv6"
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "h2-in",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "password": "$(json_escape "$PASSWORD")"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "$DATA_DIR/cert.pem",
+        "key_path": "$DATA_DIR/key.pem"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": ${VLESS_PORT},
+      "users": [
+        {
+          "name": "default",
+          "uuid": "${VLESS_UUID}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "vspo.jp",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "vspo.jp",
+            "server_port": 443
+          },
+          "private_key": "${REALITY_PRIVATE}",
+          "short_id": ["${REALITY_SHORT_ID}"]
+        }
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-in",
+      "listen": "::",
+      "listen_port": ${TROJAN_PORT},
+      "users": [
+        {
+          "name": "default",
+          "password": "$(json_escape "$PASSWORD")"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "$DATA_DIR/cert.pem",
+        "key_path": "$DATA_DIR/key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "dns-upstream",
+      "strategy": "prefer_ipv6"
+    },
+    "final": "direct"
+  }
+}
+CONFIG
+
+
+echo "Server: ${SERVER}"
+echo
+echo "hysteria2://${PASSWORD}@${SERVER}:${PORT}?insecure=1&sni=www.alibaba.com#nexus-hy2"
+echo "vless://${VLESS_UUID}@${SERVER}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=vspo.jp&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp#nexus-reality"
+echo "trojan://${PASSWORD}@${SERVER}:${TROJAN_PORT}?security=tls&sni=www.alibaba.com&allowInsecure=1#nexus-trojan"
+
+# snell-server is Surge-only and shares PASSWORD as its PSK; start it if present.
+if [ -x /usr/local/bin/snell-server ]; then
+  cat > "$DATA_DIR/snell-server.conf" << SNELL
+[snell-server]
+listen = :::${SNELL_PORT}
+psk = ${PASSWORD}
+ipv6 = true
+SNELL
+  /usr/local/bin/snell-server -c "$DATA_DIR/snell-server.conf" &
+  echo "snell (Surge): nexus = snell, ${SERVER}, ${SNELL_PORT}, psk=${PASSWORD}, version=5"
+else
+  echo "snell: disabled (snell-server binary not found)"
+fi
+
+exec sing-box run -c "$DATA_DIR/config.json"
