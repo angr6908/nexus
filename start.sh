@@ -13,6 +13,12 @@ TROJAN_PORT=55557
 SNELL_PORT=55558
 PASSWORD="${PASSWORD:-$(rand_secret)}"
 WARP="${WARP:-false}"
+# snell-server has no log config of its own, so its stdout goes to disk instead
+# of `docker compose logs`. Capped at LOG_MAX_BYTES; on overflow the newest
+# LOG_KEEP_BYTES are retained and the rest dropped.
+LOG_FILE="$DATA_DIR/nexus.log"
+LOG_MAX_BYTES=$((5 * 1024 * 1024))
+LOG_KEEP_BYTES=$((2 * 1024 * 1024))
 # Public IP for the share links. Detected here, before WARP comes up, so it's
 # the server's real inbound address and not the WARP exit IP.
 SERVER="$(wget -qO- -T 5 http://api.ipify.org 2>/dev/null || true)"
@@ -28,6 +34,27 @@ json_escape() {
     gsub(/\n/, "\\n", value)
     printf "%s", value
   }' "$1"
+}
+
+# Trim in place rather than renaming: snell-server's stdout is an append-mode fd
+# from the `>>` redirect below, so its write offset follows the truncation and
+# it keeps writing to the same inode.
+rotate_logs() {
+  size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+  [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+  if ! tail -c "$LOG_KEEP_BYTES" "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null; then
+    rm -f "$LOG_FILE.tmp"
+    return 0
+  fi
+  cat "$LOG_FILE.tmp" > "$LOG_FILE"
+  rm -f "$LOG_FILE.tmp"
+}
+
+log_rotator() {
+  while :; do
+    sleep 600
+    rotate_logs
+  done
 }
 
 warp_enabled() {
@@ -112,6 +139,9 @@ fi
 
 cat > "$DATA_DIR/config.json" << CONFIG
 {
+  "log": {
+    "disabled": true
+  },
   "dns": {
     "servers": [
       {
@@ -219,10 +249,15 @@ listen = :::${SNELL_PORT}
 psk = ${PASSWORD}
 ipv6 = true
 SNELL
-  /usr/local/bin/snell-server -c "$DATA_DIR/snell-server.conf" &
+  /usr/local/bin/snell-server -c "$DATA_DIR/snell-server.conf" >> "$LOG_FILE" 2>&1 &
   echo "snell (Surge): nexus = snell, ${SERVER}, ${SNELL_PORT}, psk=${PASSWORD}, version=5"
 else
   echo "snell: disabled (snell-server binary not found)"
 fi
+
+echo "snell logs: $LOG_FILE (capped at $((LOG_MAX_BYTES / 1024 / 1024))MB)"
+
+rotate_logs
+log_rotator &
 
 exec sing-box run -c "$DATA_DIR/config.json"
