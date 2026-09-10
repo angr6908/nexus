@@ -13,6 +13,16 @@ TROJAN_PORT=55557
 SNELL_PORT=55558
 PASSWORD="${PASSWORD:-$(rand_secret)}"
 WARP="${WARP:-false}"
+# Cloudflare rate-limits WARP device registration (HTTP 429) and wgcf does not
+# retry, so back off exponentially here. After the final attempt the script
+# exits non-zero: the proxy is never served without WARP, and `restart: always`
+# brings the container back after a delay rather than in a tight crash loop.
+WARP_MAX_ATTEMPTS="${WARP_MAX_ATTEMPTS:-6}"
+WARP_BACKOFF_SECONDS="${WARP_BACKOFF_SECONDS:-30}"
+WARP_MAX_BACKOFF_SECONDS="${WARP_MAX_BACKOFF_SECONDS:-1800}"
+# wgcf's device account lives in /tmp (ephemeral); persist a copy under /data so
+# restarts reuse the same WARP device instead of registering a new one.
+WGCF_ACCOUNT_PERSIST="$DATA_DIR/wgcf-account.toml"
 # snell-server has no log config of its own, so its stdout goes to disk instead
 # of `docker compose logs`. Capped at LOG_MAX_BYTES; on overflow the newest
 # LOG_KEEP_BYTES are retained and the rest dropped.
@@ -64,19 +74,50 @@ warp_enabled() {
   esac
 }
 
+# Build warp.conf from the WARP account, retrying with exponential backoff
+# because Cloudflare rate-limits these API calls (HTTP 429) and wgcf does not
+# retry. A successful registration is persisted under /data so retries — and
+# later container restarts — reuse the same device instead of registering a new
+# one against the same rate limit.
+build_warp_profile() {
+  attempt=1
+  delay=$WARP_BACKOFF_SECONDS
+  while :; do
+    if [ ! -f "$WGCF_ACCOUNT_PERSIST" ]; then
+      echo "Registering WARP account (attempt ${attempt}/${WARP_MAX_ATTEMPTS})..."
+      # wgcf refuses to overwrite an existing account, so clear partial state.
+      rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
+      if (cd /tmp && wgcf register --accept-tos); then
+        cp /tmp/wgcf-account.toml "$WGCF_ACCOUNT_PERSIST"
+        chmod 600 "$WGCF_ACCOUNT_PERSIST"
+      fi
+    fi
+    if [ -f "$WGCF_ACCOUNT_PERSIST" ]; then
+      cp "$WGCF_ACCOUNT_PERSIST" /tmp/wgcf-account.toml
+      if (cd /tmp && wgcf generate --profile /tmp/wgcf-profile.conf); then
+        # Force IPv4 endpoint and set MTU
+        sed -i 's|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = 162.159.192.1:2408|' /tmp/wgcf-profile.conf
+        sed -i 's|^[[:space:]]*MTU[[:space:]]*=.*|MTU = 1280|' /tmp/wgcf-profile.conf
+        cp /tmp/wgcf-profile.conf "$DATA_DIR/warp.conf"
+        chmod 600 "$DATA_DIR/warp.conf"
+        return 0
+      fi
+    fi
+    if [ "$attempt" -ge "$WARP_MAX_ATTEMPTS" ]; then
+      echo "[warp] failed to provision WARP after ${WARP_MAX_ATTEMPTS} attempts" >&2
+      return 1
+    fi
+    echo "[warp] attempt ${attempt} failed, retrying in ${delay}s" >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+    [ "$delay" -le "$WARP_MAX_BACKOFF_SECONDS" ] || delay=$WARP_MAX_BACKOFF_SECONDS
+  done
+}
+
 setup_warp() {
   if [ ! -f "$DATA_DIR/warp.conf" ]; then
-    echo "Registering WARP account..."
-    (
-      cd /tmp
-      wgcf register --accept-tos
-      wgcf generate
-      # Force IPv4 endpoint and set MTU
-      sed -i 's|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = 162.159.192.1:2408|' /tmp/wgcf-profile.conf
-      sed -i 's|^[[:space:]]*MTU[[:space:]]*=.*|MTU = 1280|' /tmp/wgcf-profile.conf
-      cp /tmp/wgcf-profile.conf "$DATA_DIR/warp.conf"
-    )
-    chmod 600 "$DATA_DIR/warp.conf"
+    build_warp_profile || return 1
   fi
   # wg-quick would rewrite resolv.conf via the DNS line; sing-box handles
   # its own DNS, so drop it and let the container resolver work normally.
@@ -112,7 +153,10 @@ if warp_enabled; then
     echo "[warp] wg-quick not found — install wireguard-tools in the image" >&2
     exit 1
   fi
-  setup_warp
+  if ! setup_warp; then
+    echo "[warp] WARP unavailable — refusing to serve without it; exiting so Docker can retry" >&2
+    exit 1
+  fi
   if [ -f "$DATA_DIR/warp.conf" ]; then
     # Alpine disables IPv6 by default; wg-quick needs it for ::/0 AllowedIPs.
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
@@ -151,8 +195,7 @@ cat > "$DATA_DIR/config.json" << CONFIG
     ],
     "rules": [
       {
-        "server": "dns-upstream",
-        "strategy": "prefer_ipv6"
+        "server": "dns-upstream"
       }
     ],
     "strategy": "prefer_ipv6"
