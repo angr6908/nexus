@@ -19,6 +19,8 @@ WGCF_ACCOUNT_PERSIST="$DATA_DIR/wgcf-account.toml"
 WARP_ENDPOINT="${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}"
 WARP_MTU="${WARP_MTU:-1420}"
 case "$WARP_MTU" in ''|*[!0-9]*) echo "[warp] invalid WARP_MTU: $WARP_MTU" >&2; WARP_MTU=1420 ;; esac
+WARP_KEEPALIVE="${WARP_KEEPALIVE:-25}"
+case "$WARP_KEEPALIVE" in ''|*[!0-9]*) echo "[warp] invalid WARP_KEEPALIVE: $WARP_KEEPALIVE" >&2; WARP_KEEPALIVE=25 ;; esac
 LOG_FILE="$DATA_DIR/nexus.log"
 LOG_MAX_BYTES=$((5 * 1024 * 1024))
 LOG_KEEP_BYTES=$((2 * 1024 * 1024))
@@ -110,6 +112,14 @@ set_profile_mtu() {
   sed -i "s|^[[:space:]]*MTU[[:space:]]*=.*|MTU = ${WARP_MTU}|" "$DATA_DIR/warp.conf"
 }
 
+set_profile_keepalive() {
+  if grep -q '^[[:space:]]*PersistentKeepalive[[:space:]]*=' "$DATA_DIR/warp.conf"; then
+    sed -i "s|^[[:space:]]*PersistentKeepalive[[:space:]]*=.*|PersistentKeepalive = ${WARP_KEEPALIVE}|" "$DATA_DIR/warp.conf"
+  else
+    printf 'PersistentKeepalive = %s\n' "$WARP_KEEPALIVE" >> "$DATA_DIR/warp.conf"
+  fi
+}
+
 mkdir -p "$DATA_DIR"
 
 if [ ! -f "$DATA_DIR/cert.pem" ]; then
@@ -145,6 +155,7 @@ if warp_enabled; then
   if [ -f "$DATA_DIR/warp.conf" ]; then
     apply_profile_endpoint
     set_profile_mtu
+    set_profile_keepalive
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
     wg-quick up "$DATA_DIR/warp.conf"
     if command -v ip >/dev/null 2>&1; then
@@ -157,7 +168,7 @@ if warp_enabled; then
         ip -6 rule add from "$ETH0_IP6" lookup main pref 100 2>/dev/null || true
       fi
     fi
-    echo "[warp] enabled (system wg interface: warp, mtu $WARP_MTU)"
+    echo "[warp] enabled (system wg interface: warp, mtu $WARP_MTU, keepalive ${WARP_KEEPALIVE}s)"
   fi
 else
   echo "[warp] off"
